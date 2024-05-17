@@ -14,9 +14,11 @@ import time
 import laspy
 
 class DiffCompletion(LightningModule):
-    def __init__(self, diff_path, refine_path, denoising_steps, cond_weight, scheduler_type='dpm_solver'):
+    def __init__(self, diff_path, refine_path, denoising_steps, cond_weight, scheduler_type='dpm_solver', device='cuda'):
         super().__init__()
         ckpt_diff = torch.load(diff_path)
+        self.device = torch.device(device)
+        self.scheduler_to_cuda()
         self.save_hyperparameters(ckpt_diff['hyper_parameters'])
         assert denoising_steps <= self.hparams['diff']['t_steps'], \
         f"The number of denoising steps cannot be bigger than T={self.hparams['diff']['t_steps']} (you've set '-T {denoising_steps}')"
@@ -75,13 +77,16 @@ class DiffCompletion(LightningModule):
             yaml.dump(self.hparams, exp_config)
 
     def scheduler_to_cuda(self):
-        self.scheduler.timesteps = self.scheduler.timesteps.cuda()
-        self.scheduler.betas = self.scheduler.betas.cuda()
-        self.scheduler.alphas = self.scheduler.alphas.cuda()
-        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.cuda()
+    attributes = ['timesteps', 'betas', 'alphas', 'alphas_cumprod']
+    if self.scheduler_type == 'dpm_solver':
+        attributes.append('sigmas')
+    for attr in attributes:
+        setattr(self.scheduler, attr, getattr(self.scheduler, attr).cuda())
 
-        if hasattr(self.scheduler, 'sigmas'):
-            self.scheduler.sigmas = self.scheduler.sigmas.cuda()
+    if hasattr(self.scheduler, 'alpha_t'):
+        self.scheduler.alpha_t = self.scheduler.alpha_t.to(self.device)
+    if hasattr(self.scheduler, 'sigma_t'):
+        self.scheduler.sigma_t = self.scheduler.sigma_t.to(self.device)
 
 
     def points_to_tensor(self, points):
@@ -172,25 +177,25 @@ class DiffCompletion(LightningModule):
         return x_uncond + self.w_uncond * (x_cond - x_uncond)
 
     def completion_loop(self, x_init, x_t, x_cond, x_uncond):
-        self.scheduler_to_cuda()
+    self.scheduler_to_cuda()
+    for t in tqdm.tqdm(self.scheduler.timesteps):
+        t = t.to(self.device)[None]
+        noise_t = self.classfree_forward(x_t, x_cond, x_uncond, t)
 
-        for t in tqdm.tqdm(self.scheduler.timesteps):
-            t = t.to(self.device)[None]  # Move timestep to the same device as the scheduler tensors
+        # Ensure input_noise is on the correct device
+        input_noise = (x_t.F.reshape(t.shape[0], -1, 3) - x_init).to(self.device)
 
-            noise_t = self.classfree_forward(x_t, x_cond, x_uncond, t)
-            input_noise = x_t.F.reshape(t.shape[0], -1, 3) - x_init
-        
-            if self.scheduler_type == 'dpm_solver':
-                x_t = x_init + self.scheduler.step(noise_t, t, input_noise)['prev_sample']
-            else:
-                x_t = self.scheduler.step(x_t, t, noise_t).prev_sample
-        
-            x_t = self.points_to_tensor(x_t)
+        if self.scheduler_type == 'dpm_solver':
+            x_t = x_init + self.scheduler.step(noise_t, t, input_noise)['prev_sample']
+        else:
+            x_t = self.scheduler.step(x_t, t, noise_t).prev_sample
 
-            x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
-            torch.cuda.empty_cache()
+        x_t = self.points_to_tensor(x_t)
+        x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
+        torch.cuda.empty_cache()
 
-        return x_t.F.cpu().detach().numpy()
+    return x_t.F.cpu().detach().numpy()
+
 
 def load_pcd(pcd_file):
     if pcd_file.endswith('.bin'):
