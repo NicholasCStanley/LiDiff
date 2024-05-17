@@ -172,7 +172,7 @@ class DiffCompletion(LightningModule):
         return x_uncond + self.w_uncond * (x_cond - x_uncond)
 
     def completion_loop(self, x_init, x_t, x_cond, x_uncond):
-    self.scheduler_to_cuda()
+        self.scheduler_to_cuda()
 
     for t in tqdm.tqdm(self.scheduler.timesteps):
         t = t.to(self.device)[None]  # Move timestep to the same device as the scheduler tensors
@@ -190,7 +190,7 @@ class DiffCompletion(LightningModule):
         x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
         torch.cuda.empty_cache()
 
-    return x_t.F.cpu().detach().numpy()
+        return x_t.F.cpu().detach().numpy()
 
 def load_pcd(pcd_file):
     if pcd_file.endswith('.bin'):
