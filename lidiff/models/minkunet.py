@@ -178,7 +178,6 @@ class MinkUNetDiff(nn.Module):
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Linear(self.embed_dim, cs[4]),
-            dtype=torch.float32
         )
 
         self.stage1 = nn.Sequential(
