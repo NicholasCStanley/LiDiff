@@ -77,7 +77,7 @@ class DiffCompletion(LightningModule):
             yaml.dump(self.hparams, exp_config)
 
     def scheduler_to_cuda(self):
-    attributes = ['timesteps', 'betas', 'alphas', 'alphas_cumprod']
+        attributes = ['timesteps', 'betas', 'alphas', 'alphas_cumprod']
     if self.scheduler_type == 'dpm_solver':
         attributes.append('sigmas')
     for attr in attributes:
