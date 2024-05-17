@@ -177,7 +177,7 @@ class DiffCompletion(LightningModule):
         return x_uncond + self.w_uncond * (x_cond - x_uncond)
 
     def completion_loop(self, x_init, x_t, x_cond, x_uncond):
-    self.scheduler_to_cuda()
+        self.scheduler_to_cuda()
     for t in tqdm.tqdm(self.scheduler.timesteps):
         t = t.to(self.device)[None]
         noise_t = self.classfree_forward(x_t, x_cond, x_uncond, t)
