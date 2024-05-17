@@ -178,6 +178,7 @@ class MinkUNetDiff(nn.Module):
             nn.Linear(self.embed_dim, self.embed_dim),
             nn.LeakyReLU(0.1, inplace=True),
             nn.Linear(self.embed_dim, cs[4]),
+            dtype=torch.float32
         )
 
         self.stage1 = nn.Sequential(
@@ -422,7 +423,8 @@ class MinkUNetDiff(nn.Module):
 
         x0 = self.stem(x_sparse)
         match0 = self.match_part_to_full(x0, part_feats)
-        p0 = self.latent_stage1(match0) 
+        p0 = self.latent_stage1(match0)
+        temp_emb = temp_emb.float()
         t0 = self.stage1_temp(temp_emb)
         batch_temp = torch.unique(x0.C[:,0], return_counts=True)[1]
         t0 = torch.repeat_interleave(t0, batch_temp, dim=0) 
