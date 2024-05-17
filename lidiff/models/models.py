@@ -13,13 +13,14 @@ from pytorch_lightning.core.lightning import LightningModule
 from pytorch_lightning import LightningDataModule
 from lidiff.utils.collations import *
 from lidiff.utils.metrics import ChamferDistance, PrecisionRecall
-from diffusers import DPMSolverMultistepScheduler
+from diffusers import DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler, DDIMScheduler
 
 class DiffusionPoints(LightningModule):
-    def __init__(self, hparams:dict, data_module: LightningDataModule = None):
+    def __init__(self, hparams: dict, data_module: LightningDataModule = None, scheduler_type='dpm_solver'):
         super().__init__()
         self.save_hyperparameters(hparams)
         self.data_module = data_module
+        self.scheduler_type = scheduler_type
 
         # alphas and betas
         if self.hparams['diff']['beta_func'] == 'cosine':
@@ -60,16 +61,33 @@ class DiffusionPoints(LightningModule):
 
         self.posterior_mean_coef1 = self.betas * torch.sqrt(self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
-        
+
         # for fast sampling
-        self.dpm_scheduler = DPMSolverMultistepScheduler(
+        if self.scheduler_type == 'dpm_solver':
+            self.dpm_scheduler = DPMSolverMultistepScheduler(
                 num_train_timesteps=self.t_steps,
                 beta_start=self.hparams['diff']['beta_start'],
                 beta_end=self.hparams['diff']['beta_end'],
                 beta_schedule='linear',
                 algorithm_type='sde-dpmsolver++',
                 solver_order=2,
-        )
+            )
+        elif self.scheduler_type == 'euler_ancestral':
+            self.dpm_scheduler = EulerAncestralDiscreteScheduler(
+                num_train_timesteps=self.t_steps,
+                beta_start=self.hparams['diff']['beta_start'],
+                beta_end=self.hparams['diff']['beta_end'],
+            )
+        elif self.scheduler_type == 'ddim':
+            self.dpm_scheduler = DDIMScheduler(
+                num_train_timesteps=self.t_steps,
+                beta_start=self.hparams['diff']['beta_start'],
+                beta_end=self.hparams['diff']['beta_end'],
+                beta_schedule='linear',
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
+
         self.dpm_scheduler.set_timesteps(self.s_steps)
         self.scheduler_to_cuda()
 
@@ -86,10 +104,15 @@ class DiffusionPoints(LightningModule):
         self.dpm_scheduler.betas = self.dpm_scheduler.betas.cuda()
         self.dpm_scheduler.alphas = self.dpm_scheduler.alphas.cuda()
         self.dpm_scheduler.alphas_cumprod = self.dpm_scheduler.alphas_cumprod.cuda()
-        self.dpm_scheduler.alpha_t = self.dpm_scheduler.alpha_t.cuda()
-        self.dpm_scheduler.sigma_t = self.dpm_scheduler.sigma_t.cuda()
-        self.dpm_scheduler.lambda_t = self.dpm_scheduler.lambda_t.cuda()
-        self.dpm_scheduler.sigmas = self.dpm_scheduler.sigmas.cuda()
+
+        if hasattr(self.dpm_scheduler, 'alpha_t'):
+            self.dpm_scheduler.alpha_t = self.dpm_scheduler.alpha_t.cuda()
+        if hasattr(self.dpm_scheduler, 'sigma_t'):
+            self.dpm_scheduler.sigma_t = self.dpm_scheduler.sigma_t.cuda()
+        if hasattr(self.dpm_scheduler, 'lambda_t'):
+            self.dpm_scheduler.lambda_t = self.dpm_scheduler.lambda_t.cuda()
+        if hasattr(self.dpm_scheduler, 'sigmas'):
+            self.dpm_scheduler.sigmas = self.dpm_scheduler.sigmas.cuda()
 
     def q_sample(self, x, t, noise):
         return self.sqrt_alphas_cumprod[t][:,None,None].cuda() * x + \
@@ -238,113 +261,109 @@ class DiffusionPoints(LightningModule):
             x_gen_eval = x_gen_eval.F.reshape((gt_pts.shape[0],-1,3))
 
             for i in range(len(batch['pcd_full'])):
-                pcd_pred = o3d.geometry.PointCloud()
-                c_pred = x_gen_eval[i].cpu().detach().numpy()
-                pcd_pred.points = o3d.utility.Vector3dVector(c_pred)
+            pcd_pred = o3d.geometry.PointCloud()
+            c_pred = x_gen_eval[i].cpu().detach().numpy()
+            pcd_pred.points = o3d.utility.Vector3dVector(c_pred)
 
-                pcd_gt = o3d.geometry.PointCloud()
-                g_pred = batch['pcd_full'][i].cpu().detach().numpy()
-                pcd_gt.points = o3d.utility.Vector3dVector(g_pred)
+            pcd_gt = o3d.geometry.PointCloud()
+            g_pred = batch['pcd_full'][i].cpu().detach().numpy()
+            pcd_gt.points = o3d.utility.Vector3dVector(g_pred)
 
-                self.chamfer_distance.update(pcd_gt, pcd_pred)
-                self.precision_recall.update(pcd_gt, pcd_pred)
+            self.chamfer_distance.update(pcd_gt, pcd_pred)
+            self.precision_recall.update(pcd_gt, pcd_pred)
 
-        cd_mean, cd_std = self.chamfer_distance.compute()
-        pr, re, f1 = self.precision_recall.compute_auc()
+    cd_mean, cd_std = self.chamfer_distance.compute()
+    pr, re, f1 = self.precision_recall.compute_auc()
 
-        self.log('val/cd_mean', cd_mean, on_step=True)
-        self.log('val/cd_std', cd_std, on_step=True)
-        self.log('val/precision', pr, on_step=True)
-        self.log('val/recall', re, on_step=True)
-        self.log('val/fscore', f1, on_step=True)
-        torch.cuda.empty_cache()
+    self.log('val/cd_mean', cd_mean, on_step=True)
+    self.log('val/cd_std', cd_std, on_step=True)
+    self.log('val/precision', pr, on_step=True)
+    self.log('val/recall', re, on_step=True)
+    self.log('val/fscore', f1, on_step=True)
+    torch.cuda.empty_cache()
 
-        return {'val/cd_mean': cd_mean, 'val/cd_std': cd_std, 'val/precision': pr, 'val/recall': re, 'val/fscore': f1}
-    
-    def valid_paths(self, filenames):
-        output_paths = []
-        skip = []
+    return {'val/cd_mean': cd_mean, 'val/cd_std': cd_std, 'val/precision': pr, 'val/recall': re, 'val/fscore': f1}
 
-        for fname in filenames:
-            seq_dir =  f'{self.logger.log_dir}/generated_pcd/{fname.split("/")[-3]}'
-            ply_name = f'{fname.split("/")[-1].split(".")[0]}.ply'
+def valid_paths(self, filenames):
+    output_paths = []
+    skip = []
 
-            skip.append(path.isfile(f'{seq_dir}/{ply_name}'))
-            makedirs(seq_dir, exist_ok=True)
-            output_paths.append(f'{seq_dir}/{ply_name}')
+    for fname in filenames:
+        seq_dir =  f'{self.logger.log_dir}/generated_pcd/{fname.split("/")[-3]}'
+        ply_name = f'{fname.split("/")[-1].split(".")[0]}.ply'
 
-        return np.all(skip), output_paths
+        skip.append(path.isfile(f'{seq_dir}/{ply_name}'))
+        makedirs(seq_dir, exist_ok=True)
+        output_paths.append(f'{seq_dir}/{ply_name}')
 
-    def test_step(self, batch:dict, batch_idx):
-        self.model.eval()
-        self.partial_enc.eval()
-        with torch.no_grad():
-            skip, output_paths = self.valid_paths(batch['filename'])
+    return np.all(skip), output_paths
 
-            if skip:
-                print(f'Skipping generation from {output_paths[0]} to {output_paths[-1]}') 
-                return {'test/cd_mean': 0., 'test/cd_std': 0., 'test/precision': 0., 'test/recall': 0., 'test/fscore': 0.}
+def test_step(self, batch:dict, batch_idx):
+    self.model.eval()
+    self.partial_enc.eval()
+    with torch.no_grad():
+        skip, output_paths = self.valid_paths(batch['filename'])
 
-            gt_pts = batch['pcd_full'].detach().cpu().numpy()
+        if skip:
+            print(f'Skipping generation from {output_paths[0]} to {output_paths[-1]}') 
+            return {'test/cd_mean': 0., 'test/cd_std': 0., 'test/precision': 0., 'test/recall': 0., 'test/fscore': 0.}
 
-            x_init = batch['pcd_part'].repeat(1,10,1)
-            x_feats = x_init + torch.randn(x_init.shape, device=self.device)
-            x_full = self.points_to_tensor(x_feats, batch['mean'], batch['std'])
-            x_part = self.points_to_tensor(batch['pcd_part'], batch['mean'], batch['std'])
-            x_uncond = self.points_to_tensor(
-                torch.zeros_like(batch['pcd_part']), torch.zeros_like(batch['mean']), torch.zeros_like(batch['std'])
-            )
+        gt_pts = batch['pcd_full'].detach().cpu().numpy()
 
-            x_gen_eval = self.p_sample_loop(x_init, x_full, x_part, x_uncond, gt_pts, batch['mean'], batch['std'])
-            x_gen_eval = x_gen_eval.F.reshape((gt_pts.shape[0],-1,3))
+        x_init = batch['pcd_part'].repeat(1,10,1)
+        x_feats = x_init + torch.randn(x_init.shape, device=self.device)
+        x_full = self.points_to_tensor(x_feats, batch['mean'], batch['std'])
+        x_part = self.points_to_tensor(batch['pcd_part'], batch['mean'], batch['std'])
+        x_uncond = self.points_to_tensor(
+            torch.zeros_like(batch['pcd_part']), torch.zeros_like(batch['mean']), torch.zeros_like(batch['std'])
+        )
 
-            for i in range(len(batch['pcd_full'])):
-                pcd_pred = o3d.geometry.PointCloud()
-                c_pred = x_gen_eval[i].cpu().detach().numpy()
-                dist_pts = np.sqrt(np.sum((c_pred)**2, axis=-1))
-                dist_idx = dist_pts < self.hparams['data']['max_range']
-                points = c_pred[dist_idx]
-                max_z = x_init[i][...,2].max().item()
-                min_z = (x_init[i][...,2].mean() - 2 * x_init[i][...,2].std()).item()
-                pcd_pred.points = o3d.utility.Vector3dVector(points[(points[:,2] < max_z) & (points[:,2] > min_z)])
-                pcd_pred.paint_uniform_color([1.0, 0.,0.])
+        x_gen_eval = self.p_sample_loop(x_init, x_full, x_part, x_uncond, gt_pts, batch['mean'], batch['std'])
+        x_gen_eval = x_gen_eval.F.reshape((gt_pts.shape[0],-1,3))
 
-                pcd_gt = o3d.geometry.PointCloud()
-                g_pred = batch['pcd_full'][i].cpu().detach().numpy()
-                pcd_gt.points = o3d.utility.Vector3dVector(g_pred)
-                pcd_gt.paint_uniform_color([0., 1.,0.])
-                
-                print(f'Saving {output_paths[i]}')
-                o3d.io.write_point_cloud(f'{output_paths[i]}', pcd_pred)
+        for i in range(len(batch['pcd_full'])):
+            pcd_pred = o3d.geometry.PointCloud()
+            c_pred = x_gen_eval[i].cpu().detach().numpy()
+            dist_pts = np.sqrt(np.sum((c_pred)**2, axis=-1))
+            dist_idx = dist_pts < self.hparams['data']['max_range']
+            points = c_pred[dist_idx]
+            max_z = x_init[i][...,2].max().item()
+            min_z = (x_init[i][...,2].mean() - 2 * x_init[i][...,2].std()).item()
+            pcd_pred.points = o3d.utility.Vector3dVector(points[(points[:,2] < max_z) & (points[:,2] > min_z)])
+            pcd_pred.paint_uniform_color([1.0, 0.,0.])
 
-                self.chamfer_distance.update(pcd_gt, pcd_pred)
-                self.precision_recall.update(pcd_gt, pcd_pred)
+            pcd_gt = o3d.geometry.PointCloud()
+            g_pred = batch['pcd_full'][i].cpu().detach().numpy()
+            pcd_gt.points = o3d.utility.Vector3dVector(g_pred)
+            pcd_gt.paint_uniform_color([0., 1.,0.])
+            
+            print(f'Saving {output_paths[i]}')
+            o3d.io.write_point_cloud(f'{output_paths[i]}', pcd_pred)
 
-        cd_mean, cd_std = self.chamfer_distance.compute()
-        pr, re, f1 = self.precision_recall.compute_auc()
-        print(f'CD Mean: {cd_mean}\tCD Std: {cd_std}')
-        print(f'Precision: {pr}\tRecall: {re}\tF-Score: {f1}')
+            self.chamfer_distance.update(pcd_gt, pcd_pred)
+            self.precision_recall.update(pcd_gt, pcd_pred)
 
-        self.log('test/cd_mean', cd_mean, on_step=True)
-        self.log('test/cd_std', cd_std, on_step=True)
-        self.log('test/precision', pr, on_step=True)
-        self.log('test/recall', re, on_step=True)
-        self.log('test/fscore', f1, on_step=True)
-        torch.cuda.empty_cache()
+    cd_mean, cd_std = self.chamfer_distance.compute()
+    pr, re, f1 = self.precision_recall.compute_auc()
+    print(f'CD Mean: {cd_mean}\tCD Std: {cd_std}')
+    print(f'Precision: {pr}\tRecall: {re}\tF-Score: {f1}')
 
-        return {'test/cd_mean': cd_mean, 'test/cd_std': cd_std, 'test/precision': pr, 'test/recall': re, 'test/fscore': f1}
+    self.log('test/cd_mean', cd_mean, on_step=True)
+    self.log('test/cd_std', cd_std, on_step=True)
+    self.log('test/precision', pr, on_step=True)
+    self.log('test/recall', re, on_step=True)
+    self.log('test/fscore', f1, on_step=True)
+    torch.cuda.empty_cache()
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams['train']['lr'], betas=(0.9, 0.999))
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.5)
-        scheduler = {
-            'scheduler': scheduler, # lr * 0.5
-            'interval': 'epoch', # interval is epoch-wise
-            'frequency': 5, # after 5 epochs
-        }
+    return {'test/cd_mean': cd_mean, 'test/cd_std': cd_std, 'test/precision': pr, 'test/recall': re, 'test/fscore': f1}
 
-        return [optimizer], [scheduler]
+def configure_optimizers(self):
+    optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams['train']['lr'], betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.5)
+    scheduler = {
+        'scheduler': scheduler, # lr * 0.5
+        'interval': 'epoch', # interval is epoch-wise
+        'frequency': 5, # after 5 epochs
+    }
 
-#######################################
-# Modules
-#######################################
+    return [optimizer], [scheduler]
