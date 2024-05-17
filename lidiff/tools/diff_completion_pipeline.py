@@ -194,7 +194,7 @@ class DiffCompletion(LightningModule):
         x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
         torch.cuda.empty_cache()
 
-    return x_t.F.cpu().detach().numpy()
+        return x_t.F.cpu().detach().numpy()
 
 
 def load_pcd(pcd_file):
