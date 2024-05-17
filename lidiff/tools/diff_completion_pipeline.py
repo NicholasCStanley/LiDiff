@@ -3,7 +3,7 @@ import MinkowskiEngine as ME
 import torch
 import lidiff.models.minkunet as minknet
 import open3d as o3d
-from diffusers import DPMSolverMultistepScheduler
+from diffusers import DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler, DDIMScheduler
 from pytorch_lightning.core.lightning import LightningModule
 import yaml
 import os
@@ -11,15 +11,43 @@ import tqdm
 from natsort import natsorted
 import click
 import time
+import laspy
 
 class DiffCompletion(LightningModule):
-    def __init__(self, diff_path, refine_path, denoising_steps, cond_weight):
+    def __init__(self, diff_path, refine_path, denoising_steps, cond_weight, scheduler_type='dpm_solver'):
         super().__init__()
         ckpt_diff = torch.load(diff_path)
         self.save_hyperparameters(ckpt_diff['hyper_parameters'])
         assert denoising_steps <= self.hparams['diff']['t_steps'], \
         f"The number of denoising steps cannot be bigger than T={self.hparams['diff']['t_steps']} (you've set '-T {denoising_steps}')"
+        self.scheduler_type = scheduler_type
+        if self.scheduler_type == 'dpm_solver':
+            self.scheduler = DPMSolverMultistepScheduler(
+                num_train_timesteps=self.hparams['diff']['t_steps'],
+                beta_start=self.hparams['diff']['beta_start'],
+                beta_end=self.hparams['diff']['beta_end'],
+                beta_schedule='linear',
+                algorithm_type='sde-dpmsolver++',
+                solver_order=2,
+            )
+        elif self.scheduler_type == 'euler_ancestral':
+            self.scheduler = EulerAncestralDiscreteScheduler(
+                num_train_timesteps=self.hparams['diff']['t_steps'],
+                beta_start=self.hparams['diff']['beta_start'],
+                beta_end=self.hparams['diff']['beta_end'],
+            )
+        elif self.scheduler_type == 'ddim':
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps=self.hparams['diff']['t_steps'],
+                beta_start=self.hparams['diff']['beta_start'],
+                beta_end=self.hparams['diff']['beta_end'],
+                beta_schedule='linear',
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
 
+        self.scheduler.set_timesteps(self.hparams['diff']['s_steps'])
+        self.scheduler_to_cuda()
         self.partial_enc = minknet.MinkGlobalEnc(in_channels=3, out_channels=self.hparams['model']['out_dim']).cuda()
         self.model = minknet.MinkUNetDiff(in_channels=3, out_channels=self.hparams['model']['out_dim']).cuda()
         self.model_refine = minknet.MinkUNet(in_channels=3, out_channels=3*6)
@@ -35,19 +63,10 @@ class DiffCompletion(LightningModule):
 
         # for fast sampling
         self.hparams['diff']['s_steps'] = denoising_steps
-        self.dpm_scheduler = DPMSolverMultistepScheduler(
-                num_train_timesteps=self.hparams['diff']['t_steps'],
-                beta_start=self.hparams['diff']['beta_start'],
-                beta_end=self.hparams['diff']['beta_end'],
-                beta_schedule='linear',
-                algorithm_type='sde-dpmsolver++',
-                solver_order=2,
-        )
-        self.dpm_scheduler.set_timesteps(self.hparams['diff']['s_steps'])
         self.scheduler_to_cuda()
 
         self.hparams['train']['uncond_w'] = cond_weight
-        self.hparams['data']['max_range'] = 50.
+        self.hparams['data']['max_range'] = 500.
         self.w_uncond = self.hparams['train']['uncond_w']
         
         exp_dir = diff_path.split('/')[-1].split('.')[0].replace('=','')  + f'_T{denoising_steps}_s{cond_weight}'
@@ -56,14 +75,14 @@ class DiffCompletion(LightningModule):
             yaml.dump(self.hparams, exp_config)
 
     def scheduler_to_cuda(self):
-        self.dpm_scheduler.timesteps = self.dpm_scheduler.timesteps.cuda()
-        self.dpm_scheduler.betas = self.dpm_scheduler.betas.cuda()
-        self.dpm_scheduler.alphas = self.dpm_scheduler.alphas.cuda()
-        self.dpm_scheduler.alphas_cumprod = self.dpm_scheduler.alphas_cumprod.cuda()
-        self.dpm_scheduler.alpha_t = self.dpm_scheduler.alpha_t.cuda()
-        self.dpm_scheduler.sigma_t = self.dpm_scheduler.sigma_t.cuda()
-        self.dpm_scheduler.lambda_t = self.dpm_scheduler.lambda_t.cuda()
-        self.dpm_scheduler.sigmas = self.dpm_scheduler.sigmas.cuda()
+        self.scheduler.timesteps = self.scheduler.timesteps.cuda()
+        self.scheduler.betas = self.scheduler.betas.cuda()
+        self.scheduler.alphas = self.scheduler.alphas.cuda()
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.cuda()
+
+        if hasattr(self.scheduler, 'sigmas'):
+            self.scheduler.sigmas = self.scheduler.sigmas.cuda()
+
 
     def points_to_tensor(self, points):
         x_feats = ME.utils.batched_coordinates(list(points[:]), dtype=torch.float32, device=self.device)
@@ -96,7 +115,7 @@ class DiffCompletion(LightningModule):
         # use farthest point sampling
         pcd_scan = o3d.geometry.PointCloud()
         pcd_scan.points = o3d.utility.Vector3dVector(scan)
-        pcd_scan = pcd_scan.farthest_point_down_sample(int(self.hparams['data']['num_points'] / 10))
+        pcd_scan = pcd_scan.farthest_point_down_sample(int(self.hparams['data']['num_points'] / 4))
         scan = torch.tensor(np.array(pcd_scan.points)).cuda()
         
         scan = scan.repeat(10,1)
@@ -155,12 +174,17 @@ class DiffCompletion(LightningModule):
     def completion_loop(self, x_init, x_t, x_cond, x_uncond):
         self.scheduler_to_cuda()
 
-        for t in tqdm.tqdm(range(len(self.dpm_scheduler.timesteps))):
-            t = self.dpm_scheduler.timesteps[t].cuda()[None]
+        for t in tqdm.tqdm(self.scheduler.timesteps):
+            t = t.cuda()[None]
 
             noise_t = self.classfree_forward(x_t, x_cond, x_uncond, t)
-            input_noise = x_t.F.reshape(t.shape[0],-1,3) - x_init
-            x_t = x_init + self.dpm_scheduler.step(noise_t, t, input_noise)['prev_sample']
+            input_noise = x_t.F.reshape(t.shape[0], -1, 3) - x_init
+            
+            if self.scheduler_type == 'dpm_solver':
+                x_t = x_init + self.scheduler.step(noise_t, t, input_noise)['prev_sample']
+            else:
+                x_t = self.scheduler.step(x_t, t, noise_t).prev_sample
+            
             x_t = self.points_to_tensor(x_t)
 
             x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
@@ -173,28 +197,38 @@ def load_pcd(pcd_file):
         return np.fromfile(pcd_file, dtype=np.float32).reshape((-1,4))[:,:3]
     elif pcd_file.endswith('.ply'):
         return np.array(o3d.io.read_point_cloud(pcd_file).points)
+    elif pcd_file.endswith('.pcd'):
+        return np.array(o3d.io.read_point_cloud(pcd_file).points)
+    elif pcd_file.endswith('.las') or pcd_file.endswith('.laz'):
+        with laspy.open(pcd_file) as f:
+            las = f.read()
+            return np.vstack((las.x, las.y, las.z)).transpose()
+    elif pcd_file.endswith('.xyz'):
+        return np.loadtxt(pcd_file)
     else:
-        print(f"Point cloud format '.{pcd_file.split('.')[-1]}' not supported. (supported formats: .bin (kitti format), .ply)")
+        print(f"Point cloud format '.{pcd_file.split('.')[-1]}' not supported.")
+        return None
 
 @click.command()
-@click.option('--diff', '-d', type=str, default='checkpoints/diff_net.ckpt', help='path to the scan sequence')
-@click.option('--refine', '-r', type=str, default='checkpoints/refine_net.ckpt', help='path to the scan sequence')
+@click.option('--diff', '-d', type=str, default='checkpoints/diff_net.ckpt', help='path to the diffusion model checkpoint')
+@click.option('--refine', '-r', type=str, default='checkpoints/refine_net.ckpt', help='path to the refinement model checkpoint')
 @click.option('--denoising_steps', '-T', type=int, default=50, help='number of denoising steps (default: 50)')
 @click.option('--cond_weight', '-s', type=float, default=6.0, help='conditioning weight (default: 6.0)')
-def main(diff, refine, denoising_steps, cond_weight):
+@click.option('--input_path', '-i', type=str, required=True, help='path to the input point cloud files')
+@click.option('--output_path', '-o', type=str, required=True, help='path to save the output point cloud files')
+@click.option('--scheduler_type', '-st', type=str, default='dpm_solver', help='scheduler type (default: dpm_solver)')
+def main(diff, refine, denoising_steps, cond_weight, input_path, output_path, scheduler_type):
     exp_dir = diff.split('/')[-1].split('.')[0].replace('=','') + f'_T{denoising_steps}_s{cond_weight}'
 
     diff_completion = DiffCompletion(
-            diff, refine, denoising_steps, cond_weight
+        diff, refine, denoising_steps, cond_weight, scheduler_type
         )
 
-    path = './Datasets/test/'
+    os.makedirs(os.path.join(output_path, exp_dir, 'refine'), exist_ok=True)
+    os.makedirs(os.path.join(output_path, exp_dir, 'diff'), exist_ok=True)
 
-    os.makedirs(f'./results/{exp_dir}/refine', exist_ok=True)
-    os.makedirs(f'./results/{exp_dir}/diff', exist_ok=True)
-
-    for pcd_path in tqdm.tqdm(natsorted(os.listdir(path))):
-        pcd_file = os.path.join(path, pcd_path)
+    for pcd_path in tqdm.tqdm(natsorted(os.listdir(input_path))):
+        pcd_file = os.path.join(input_path, pcd_path)
         points = load_pcd(pcd_file)
     
         start = time.time()
@@ -204,12 +238,12 @@ def main(diff, refine, denoising_steps, cond_weight):
         pcd_refine = o3d.geometry.PointCloud()
         pcd_refine.points = o3d.utility.Vector3dVector(refine_scan)
         pcd_refine.estimate_normals()
-        o3d.io.write_point_cloud(f'./results/{exp_dir}/refine/{pcd_path.split(".")[0]}.ply', pcd_refine)
+        o3d.io.write_point_cloud(os.path.join(output_path, exp_dir, 'refine', f'{pcd_path.split(".")[0]}.ply'), pcd_refine)
 
         pcd_diff = o3d.geometry.PointCloud()
         pcd_diff.points = o3d.utility.Vector3dVector(diff_scan)
         pcd_diff.estimate_normals()
-        o3d.io.write_point_cloud(f'./results/{exp_dir}/diff/{pcd_path.split(".")[0]}.ply', pcd_diff)
+        o3d.io.write_point_cloud(os.path.join(output_path, exp_dir, 'diff', f'{pcd_path.split(".")[0]}.ply'), pcd_diff)
 
 if __name__ == '__main__':
     main()
