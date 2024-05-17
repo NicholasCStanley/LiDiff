@@ -48,9 +48,9 @@ class DiffCompletion(LightningModule):
 
         self.scheduler.set_timesteps(self.hparams['diff']['s_steps'])
         self.scheduler_to_cuda()
-        self.partial_enc = minknet.MinkGlobalEnc(in_channels=3, out_channels=self.hparams['model']['out_dim']).cuda()
-        self.model = minknet.MinkUNetDiff(in_channels=3, out_channels=self.hparams['model']['out_dim']).cuda()
-        self.model_refine = minknet.MinkUNet(in_channels=3, out_channels=3*6)
+        self.partial_enc = minknet.MinkGlobalEnc(in_channels=3, out_channels=self.hparams['model']['out_dim']).cuda().to(torch.float32)
+        self.model = minknet.MinkUNetDiff(in_channels=3, out_channels=self.hparams['model']['out_dim']).cuda().to(torch.float32)
+        self.model_refine = minknet.MinkUNet(in_channels=3, out_channels=3*6).to(torch.float32)
         self.load_state_dict(ckpt_diff['state_dict'], strict=False)
 
         ckpt_refine = torch.load(refine_path)
@@ -136,14 +136,14 @@ class DiffCompletion(LightningModule):
     def complete_scan(self, scan):
         scan = self.preprocess_scan(scan)
         x_feats = scan + torch.randn(scan.shape, device=self.device)
-        x_full = self.points_to_tensor(x_feats)
-        x_cond = self.points_to_tensor(scan)
-        x_uncond = self.points_to_tensor(torch.zeros_like(scan))
+        x_full = self.points_to_tensor(x_feats.float())  # Cast to float32
+        x_cond = self.points_to_tensor(scan.float())  # Cast to float32
+        x_uncond = self.points_to_tensor(torch.zeros_like(scan).float())  # Cast to float32
 
         completed_scan = self.completion_loop(scan, x_full, x_cond, x_uncond)
         post_scan = self.postprocess_scan(completed_scan, scan)
 
-        refine_in = self.points_to_tensor(post_scan[None,:,:])
+        refine_in = self.points_to_tensor(post_scan[None,:,:].float())  # Cast to float32
         offset = self.refine_forward(refine_in).reshape(-1,6,3)
 
         refine_complete_scan = post_scan[:,None,:] + offset.cpu().numpy()
