@@ -172,25 +172,25 @@ class DiffCompletion(LightningModule):
         return x_uncond + self.w_uncond * (x_cond - x_uncond)
 
     def completion_loop(self, x_init, x_t, x_cond, x_uncond):
-        self.scheduler_to_cuda()
+    self.scheduler_to_cuda()
 
-        for t in tqdm.tqdm(self.scheduler.timesteps):
-            t = t.cuda()[None]
+    for t in tqdm.tqdm(self.scheduler.timesteps):
+        t = t.to(self.device)[None]  # Move timestep to the same device as the scheduler tensors
 
-            noise_t = self.classfree_forward(x_t, x_cond, x_uncond, t)
-            input_noise = x_t.F.reshape(t.shape[0], -1, 3) - x_init
-            
-            if self.scheduler_type == 'dpm_solver':
-                x_t = x_init + self.scheduler.step(noise_t, t, input_noise)['prev_sample']
-            else:
-                x_t = self.scheduler.step(x_t, t, noise_t).prev_sample
-            
-            x_t = self.points_to_tensor(x_t)
+        noise_t = self.classfree_forward(x_t, x_cond, x_uncond, t)
+        input_noise = x_t.F.reshape(t.shape[0], -1, 3) - x_init
+        
+        if self.scheduler_type == 'dpm_solver':
+            x_t = x_init + self.scheduler.step(noise_t, t, input_noise)['prev_sample']
+        else:
+            x_t = self.scheduler.step(x_t, t, noise_t).prev_sample
+        
+        x_t = self.points_to_tensor(x_t)
 
-            x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
-            torch.cuda.empty_cache()
+        x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond)
+        torch.cuda.empty_cache()
 
-        return x_t.F.cpu().detach().numpy()
+    return x_t.F.cpu().detach().numpy()
 
 def load_pcd(pcd_file):
     if pcd_file.endswith('.bin'):
