@@ -2,10 +2,12 @@
 
 **[Paper](http://www.ipb.uni-bonn.de/pdfs/nunes2024cvpr.pdf)** **|** **[Sup. material](http://www.ipb.uni-bonn.de/pdfs/nunes2024cvpr-supmaterial.pdf)** **|** **[Video](https://www.youtube.com/watch?v=XWu8svlMKUo)**
 
-This repo contains the code for the scene completion diffusion method proposed in the CVPR'24 paper: "Scaling Diffusion Models to Real-World 3D LiDAR Scene Completion".
+This repo was forked from the code for the scene completion diffusion method proposed in the CVPR'24 paper: "Scaling Diffusion Models to Real-World 3D LiDAR Scene Completion".
 
-Our method leverages diffusion process as a point-wise local problem, disentangling the scene data distribution during in the diffusion process, learning only the point local neighborhood distribution. From our formulation we
-can achieve a complete scene representation from a single LiDAR scan directly operating over the 3D points.
+Their notes:
+
+"Our method leverages diffusion process as a point-wise local problem, disentangling the scene data distribution during in the diffusion process, learning only the point local neighborhood distribution. From our formulation we
+can achieve a complete scene representation from a single LiDAR scan directly operating over the 3D points."
 
 ![](media/diff_steps.png)
 
