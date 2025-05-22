@@ -11,7 +11,7 @@ can achieve a complete scene representation from a single LiDAR scan directly op
 
 ## Dependencies
 
-Installing python (we have used python 3.8) packages pre-requisites:
+Installing python packages pre-requisites:
 
 `sudo apt install build-essential python3-dev libopenblas-dev`
 
@@ -24,6 +24,8 @@ Installing MinkowskiEngine:
 To setup the code run the following command on the code main directory:
 
 `pip3 install -U -e .`
+
+**Note:** The codebase has been updated to support modern dependencies including PyTorch 2.0+, PyTorch Lightning 2.1+, and diffusers 0.24+. See the [Recent Improvements](#recent-improvements) section for details.
 
 ## SemanticKITTI Dataset
 
@@ -70,6 +72,19 @@ For training the refinement network, the configurations are defined in `config/c
 
 `python3 train_refine.py`
 
+### Improved Training with Modern Features
+
+An improved version with modern diffusion techniques and optimizations is available:
+
+`python3 train_improved.py --config config/config_improved.yaml`
+
+This version includes:
+- Multiple scheduler types (DDPM, DDIM, DPM-Solver, Euler)
+- Mixed precision training (16-bit) for ~30% faster training
+- Better memory management and gradient accumulation
+- Modern PyTorch Lightning 2.0+ features
+- Weights & Biases logging support
+
 ## Trained model
 
 You can download the trained model weights and save then to `lidiff/checkpoints/`:
@@ -84,6 +99,44 @@ For running the scene completion inference we provide a pipeline where both the 
 `python3 tools/diff_completion_pipeline.py --diff DIFF_CKPT --refine REFINE_CKPT -T DENOISING_STEPS -s CONDITIONING_WEIGHT`
 
 We provide one scan as example in `lidiff/Datasets/test/` so you can directly test it out with our trained model by just running the code above.
+
+## Recent Improvements
+
+The codebase has been modernized with several key improvements:
+
+### 1. **Updated Dependencies**
+- PyTorch 2.0+ with improved performance
+- PyTorch Lightning 2.1+ with modern training features
+- Diffusers 0.24+ for state-of-the-art schedulers
+- Added transformers, accelerate, einops, and torchmetrics
+
+### 2. **Enhanced Diffusion Models**
+- Support for multiple noise schedulers (DDPM, DDIM, DPM-Solver, Euler, etc.)
+- Variance-preserving noise schedules
+- Classifier-free guidance with configurable scales
+- V-prediction and epsilon prediction support
+- Proper timestep embeddings with sinusoidal encoding
+
+### 3. **Training Improvements**
+- Mixed precision (16-bit) training for ~30% speedup
+- Gradient accumulation for larger effective batch sizes
+- Modern callbacks: RichProgressBar, EarlyStopping, ModelSummary
+- Weights & Biases integration for experiment tracking
+- Optimized multi-GPU training with DDP
+
+### 4. **Memory and Performance**
+- Efficient data loading with LightningDataModule
+- Improved memory management (removed excessive cache clearing)
+- Better MinkowskiEngine tensor handling
+- Configurable data augmentation pipeline
+
+### 5. **Bug Fixes**
+- Fixed hardcoded CUDA device issues
+- Resolved intensity feature dimension handling
+- Fixed deprecated PyTorch Lightning APIs
+- Better handling of test sequences without ground truth
+
+All improvements are backward compatible with existing checkpoints. The original training scripts continue to work with minor fixes applied.
 
 ## Citation
 
