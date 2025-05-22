@@ -79,46 +79,64 @@ class TemporalKITTISet(Dataset):
         seq_num = self.points_datapath[index].split('/')[-3]
         fname = self.points_datapath[index].split('/')[-1].split('.')[0]
 
-        p_part = np.fromfile(self.points_datapath[index], dtype=np.float32)
-        p_part = p_part.reshape((-1,4))[:,:3]
+        # Load raw points and intensities
+        raw = np.fromfile(self.points_datapath[index], dtype=np.float32).reshape(-1,4)
+        p_part = raw[:, :3].copy()
+        i_part = raw[:, 3].copy()
         
+        # Filter out moving points by label
         if self.split != 'test':
             label_file = self.points_datapath[index].replace('velodyne', 'labels').replace('.bin', '.label')
-            l_set = np.fromfile(label_file, dtype=np.uint32)
-            l_set = l_set.reshape((-1))
+            l_set = np.fromfile(label_file, dtype=np.uint32).reshape(-1)
             l_set = l_set & 0xFFFF
             static_idx = (l_set < 252) & (l_set > 1)
             p_part = p_part[static_idx]
-        dist_part = np.sum(p_part**2, -1)**.5
-        p_part = p_part[(dist_part < self.max_range) & (dist_part > 3.5)]
-        p_part = p_part[p_part[:,2] > -4.]
+            i_part = i_part[static_idx]
+        # Range and height filtering
+        dist_part = np.linalg.norm(p_part, axis=1)
+        mask = (dist_part < self.max_range) & (dist_part > 3.5) & (p_part[:,2] > -4.)
+        p_part = p_part[mask]
+        i_part = i_part[mask]
         pose = self.seq_poses[index]
 
         p_map = self.cache_maps[seq_num]
 
+        # Generate full point cloud (map) and corresponding intensities
         if self.split != 'test':
             trans = pose[:-1,-1]
-            dist_full = np.sum((p_map - trans)**2, -1)**.5
+            dist_full = np.linalg.norm(p_map - trans, axis=1)
             p_full = p_map[dist_full < self.max_range]
-            p_full = np.concatenate((p_full, np.ones((len(p_full),1))), axis=-1)
-            p_full = (p_full @ np.linalg.inv(pose).T)[:,:3]
+            # Transform to current frame
+            homog = np.concatenate((p_full, np.ones((len(p_full),1))), axis=1)
+            p_full = (homog @ np.linalg.inv(pose).T)[:,:3]
             p_full = p_full[p_full[:,2] > -4.]
+            # No intensity available for map points: set to zero
+            i_full = np.zeros((p_full.shape[0],), dtype=np.float32)
         else:
-            p_full = p_part
+            p_full = p_part.copy()
+            i_full = i_part.copy()
 
+        # Data augmentation on training split (apply to coords only, preserve intensity)
         if self.split == 'train':
-            p_concat = np.concatenate((p_full, p_part), axis=0)
+            coords_concat = np.concatenate((p_full, p_part), axis=0)
+            intens_concat = np.concatenate((i_full, i_part), axis=0)
+            # stack coords and intensity
+            p_concat = np.concatenate((coords_concat, intens_concat[:,None]), axis=1)
             p_concat = self.transforms(p_concat)
-
-            p_full = p_concat[:-len(p_part)]
-            p_part = p_concat[-len(p_part):]
+            # split back
+            num_full = p_full.shape[0]
+            p_full = p_concat[:num_full, :3]
+            i_full = p_concat[:num_full, 3]
+            p_part = p_concat[num_full:, :3]
+            i_part = p_concat[num_full:, 3]
 
         # patial pcd has 1/10 of the complete pcd size
         n_part = int(self.num_points / 10.)
 
+        # Prepare samples to fixed size and include intensities
         return point_set_to_sparse(
-            p_full,
-            p_part,
+            np.concatenate((p_full, i_full[:,None]), axis=1),
+            np.concatenate((p_part, i_part[:,None]), axis=1),
             self.num_points,
             n_part,
             self.resolution,

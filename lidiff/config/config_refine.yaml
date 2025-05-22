@@ -34,4 +34,5 @@ diff:
 
 ##Network
 model:
-    out_dim: 96
+    # embedding dimension (for consistency, though refine network primarily uses up_factor)
+    out_dim: 128

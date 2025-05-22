@@ -1,0 +1,107 @@
+experiment:
+    id: lidiff_improved_v1
+    seed: 42
+
+##Data
+data:
+    data_dir: './Datasets/SemanticKITTI'
+    resolution: 0.05
+    dataloader: 'KITTI'
+    split: 'train'
+    train: ['00', '01', '02', '03', '04', '05', '06', '07', '09', '10']
+    validation: ['08']
+    test: ['11', '12', '13', '14', '15', '16', '17', '18', '19', '20', '21']
+    num_points: 180000
+    max_range: 50.
+    dataset_norm: False
+    std_axis_norm: False
+    # Data augmentation
+    augmentation:
+        rotation: True
+        scaling: True
+        flip: True
+        jitter: 0.01
+
+##Training
+train:
+    # Classifier-free guidance
+    uncond_prob: 0.1
+    uncond_w: 6.0
+    # Hardware
+    n_gpus: 1
+    num_workers: 8
+    # Training parameters
+    max_epoch: 50
+    lr: 1e-4
+    weight_decay: 1e-4
+    batch_size: 2
+    accumulate_grad_batches: 4  # Effective batch size = 8
+    # Learning rate schedule
+    lr_scheduler: 'cosine'
+    warmup_epochs: 5
+    # Validation
+    validate_before_training: False
+    test_after_training: True
+    # Early stopping
+    early_stop_patience: 10
+    early_stop_monitor: 'val/fscore'
+    # Gradient clipping
+    gradient_clip_val: 1.0
+    # Mixed precision training
+    precision: '16-mixed'
+    # Profiling
+    profile: False
+
+##Diffusion
+diff:
+    # Noise schedule
+    beta_start: 1e-4
+    beta_end: 0.02
+    beta_func: 'cosine'  # Options: linear, cosine, quadratic, sigmoid
+    scheduler_type: 'ddpm'  # Options: ddpm, ddim, dpm, euler
+    # Timesteps
+    t_steps: 1000
+    s_steps: 50  # Inference steps
+    # Loss weights
+    reg_weight: 1.0
+    # Advanced options
+    prediction_type: 'epsilon'  # Options: epsilon, v_prediction, sample
+    clip_sample: True
+    clip_sample_range: 3.0
+    # DDIM specific
+    ddim_eta: 0.0
+    # DPM specific
+    dpm_solver_order: 2
+    dpm_solver_algorithm: 'sde-dpmsolver++'
+
+##Network
+model:
+    # Input channels
+    in_channels_full: 3  # xyz
+    in_channels_part: 4  # xyz + intensity
+    # Model dimensions
+    out_dim: 128
+    hidden_dim: 256
+    # Architecture settings
+    num_blocks: 4
+    attention_layers: [2, 3]  # Add attention at these layers
+    dropout: 0.1
+    # Normalization
+    norm_type: 'batch'  # Options: batch, layer, group
+    # Activation
+    activation: 'relu'  # Options: relu, gelu, silu
+    # Memory efficiency
+    gradient_checkpointing: False
+    
+##Logging
+logging:
+    # TensorBoard
+    tensorboard: True
+    # Weights & Biases
+    wandb: False
+    wandb_project: 'lidiff'
+    # Logging frequency
+    log_every_n_steps: 50
+    # Save predictions
+    save_predictions: True
+    save_predictions_freq: 5  # Every N epochs

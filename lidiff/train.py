@@ -2,9 +2,15 @@ import click
 from os.path import join, dirname, abspath
 from os import environ, makedirs
 import subprocess
-from pytorch_lightning import Trainer
-from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+try:
+    from pytorch_lightning import Trainer
+    from pytorch_lightning import loggers as pl_loggers
+    from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+except ImportError:
+    import lightning.pytorch as pl
+    from lightning.pytorch import Trainer
+    from lightning.pytorch import loggers as pl_loggers
+    from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 import numpy as np
 import torch
 import yaml
@@ -52,8 +58,9 @@ def main(config, weights, checkpoint, test):
         if test:
             # we load the current config file just to overwrite inference parameters to try different stuff during inference
             ckpt_cfg = yaml.safe_load(open(weights.split('checkpoints')[0] + '/hparams.yaml'))
-            ckpt_cfg['train']['uncond_min_w'] = cfg['train']['uncond_min_w']
-            ckpt_cfg['train']['uncond_max_w'] = cfg['train']['uncond_max_w']
+            # Update test-specific configs safely
+            if 'uncond_w' in cfg['train']:
+                ckpt_cfg['train']['uncond_w'] = cfg['train']['uncond_w']
             ckpt_cfg['train']['num_workers'] = cfg['train']['num_workers']
             ckpt_cfg['train']['n_gpus'] = cfg['train']['n_gpus']
             ckpt_cfg['train']['batch_size'] = cfg['train']['batch_size']
@@ -97,7 +104,7 @@ def main(config, weights, checkpoint, test):
                           check_val_every_n_epoch=5,
                           num_sanity_val_steps=0,
                           limit_val_batches=0.001,
-                          accelerator='ddp',
+                          strategy='ddp' if torch.cuda.device_count() > 1 else 'auto',
                           )
     else:
         trainer = Trainer(gpus=cfg['train']['n_gpus'],

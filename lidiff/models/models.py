@@ -9,8 +9,13 @@ from lidiff.utils.scheduling import beta_func
 from tqdm import tqdm
 from os import makedirs, path
 
-from pytorch_lightning.core.lightning import LightningModule
-from pytorch_lightning import LightningDataModule
+try:
+    from pytorch_lightning.core.lightning import LightningModule
+    from pytorch_lightning import LightningDataModule
+except ImportError:
+    import lightning.pytorch as pl
+    LightningModule = pl.LightningModule
+    LightningDataModule = pl.LightningDataModule
 from lidiff.utils.collations import *
 from lidiff.utils.metrics import ChamferDistance, PrecisionRecall
 from diffusers import DPMSolverMultistepScheduler
@@ -73,8 +78,12 @@ class DiffusionPoints(LightningModule):
         self.dpm_scheduler.set_timesteps(self.s_steps)
         self.scheduler_to_cuda()
 
-        self.partial_enc = minknet.MinkGlobalEnc(in_channels=3, out_channels=self.hparams['model']['out_dim'])
-        self.model = minknet.MinkUNetDiff(in_channels=3, out_channels=self.hparams['model']['out_dim'])
+        # configure separate input channels for full (xyz) and partial (xyz+intensity)
+        in_ch_full = self.hparams['model'].get('in_channels_full', 3)
+        in_ch_part = self.hparams['model'].get('in_channels_part', in_ch_full)
+        out_dim = self.hparams['model']['out_dim']
+        self.partial_enc = minknet.MinkGlobalEnc(in_channels=in_ch_part, out_channels=out_dim)
+        self.model = minknet.MinkUNetDiff(in_channels=in_ch_full, out_channels=out_dim)
 
         self.chamfer_distance = ChamferDistance()
         self.precision_recall = PrecisionRecall(self.hparams['data']['resolution'],2*self.hparams['data']['resolution'],100)
@@ -82,14 +91,23 @@ class DiffusionPoints(LightningModule):
         self.w_uncond = self.hparams['train']['uncond_w']
 
     def scheduler_to_cuda(self):
-        self.dpm_scheduler.timesteps = self.dpm_scheduler.timesteps.cuda()
-        self.dpm_scheduler.betas = self.dpm_scheduler.betas.cuda()
-        self.dpm_scheduler.alphas = self.dpm_scheduler.alphas.cuda()
-        self.dpm_scheduler.alphas_cumprod = self.dpm_scheduler.alphas_cumprod.cuda()
-        self.dpm_scheduler.alpha_t = self.dpm_scheduler.alpha_t.cuda()
-        self.dpm_scheduler.sigma_t = self.dpm_scheduler.sigma_t.cuda()
-        self.dpm_scheduler.lambda_t = self.dpm_scheduler.lambda_t.cuda()
-        self.dpm_scheduler.sigmas = self.dpm_scheduler.sigmas.cuda()
+        # Move scheduler tensors to CUDA if available
+        if hasattr(self.dpm_scheduler, 'timesteps'):
+            self.dpm_scheduler.timesteps = self.dpm_scheduler.timesteps.cuda()
+        if hasattr(self.dpm_scheduler, 'betas'):
+            self.dpm_scheduler.betas = self.dpm_scheduler.betas.cuda()
+        if hasattr(self.dpm_scheduler, 'alphas'):
+            self.dpm_scheduler.alphas = self.dpm_scheduler.alphas.cuda()
+        if hasattr(self.dpm_scheduler, 'alphas_cumprod'):
+            self.dpm_scheduler.alphas_cumprod = self.dpm_scheduler.alphas_cumprod.cuda()
+        if hasattr(self.dpm_scheduler, 'alpha_t'):
+            self.dpm_scheduler.alpha_t = self.dpm_scheduler.alpha_t.cuda()
+        if hasattr(self.dpm_scheduler, 'sigma_t'):
+            self.dpm_scheduler.sigma_t = self.dpm_scheduler.sigma_t.cuda()
+        if hasattr(self.dpm_scheduler, 'lambda_t'):
+            self.dpm_scheduler.lambda_t = self.dpm_scheduler.lambda_t.cuda()
+        if hasattr(self.dpm_scheduler, 'sigmas'):
+            self.dpm_scheduler.sigmas = self.dpm_scheduler.sigmas.cuda()
 
     def q_sample(self, x, t, noise):
         return self.sqrt_alphas_cumprod[t][:,None,None].cuda() * x + \
@@ -141,10 +159,11 @@ class DiffusionPoints(LightningModule):
             x_t = x_init + self.dpm_scheduler.step(noise_t, t[0], input_noise)['prev_sample']
             x_t = self.points_to_tensor(x_t, x_mean, x_std)
 
-            # this is needed otherwise minkEngine will keep "stacking" coords maps over the x_part and x_uncond
-            # i.e. memory leak
+            # Reset partial point clouds to avoid memory accumulation in MinkowskiEngine
             x_cond, x_uncond = self.reset_partial_pcd(x_cond, x_uncond, x_mean, x_std)
-            torch.cuda.empty_cache()
+            # Clear cache periodically to prevent memory issues
+            if t % 10 == 0:
+                torch.cuda.empty_cache()
 
         makedirs(f'{self.logger.log_dir}/generated_pcd/', exist_ok=True)
 
@@ -156,30 +175,40 @@ class DiffusionPoints(LightningModule):
     def forward(self, x_full, x_full_sparse, x_part, t):
         part_feat = self.partial_enc(x_part)
         out = self.model(x_full, x_full_sparse, part_feat, t)
-        torch.cuda.empty_cache()
+        # Avoid frequent cache clearing - let PyTorch handle memory
+        # torch.cuda.empty_cache()
         return out.reshape(t.shape[0],-1,3)
 
-    def points_to_tensor(self, x_feats, mean, std):
-        x_feats = ME.utils.batched_coordinates(list(x_feats[:]), dtype=torch.float32, device=self.device)
-
-        x_coord = x_feats.clone()
-        x_coord[:,1:] = feats_to_coord(x_feats[:,1:], self.hparams['data']['resolution'], mean, std)
-
+    def points_to_tensor(self, coords, mean, std, intensity=None):
+        """Build a MinkowskiEngine TensorField from point coordinates and optional intensity."""
+        # coords: tensor of shape (B, N, 3); intensity: tensor of shape (B, N, 1) or None
+        # Quantize spatial coordinates
+        coords_list = [c for c in coords]
+        quant_coords = ME.utils.batched_coordinates(coords_list, dtype=torch.float32, device=self.device)
+        quant = quant_coords.clone()
+        quant[:,1:] = feats_to_coord(quant_coords[:,1:], self.hparams['data']['resolution'], mean, std)
+        # Prepare features
+        coords_flat = torch.cat(coords_list, dim=0)
+        if intensity is not None:
+            intens_list = [i for i in intensity]
+            intens_flat = torch.cat(intens_list, dim=0)
+            feats = torch.cat([coords_flat, intens_flat.unsqueeze(-1)], dim=1)
+        else:
+            feats = coords_flat
         x_t = ME.TensorField(
-            features=x_feats[:,1:],
-            coordinates=x_coord,
+            features=feats,
+            coordinates=quant,
             quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
             minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
             device=self.device,
         )
-
-        torch.cuda.empty_cache()
-
+        # Avoid frequent cache clearing - let PyTorch handle memory
+        # torch.cuda.empty_cache()
         return x_t
 
     def training_step(self, batch:dict, batch_idx):
         # initial random noise
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()  # Let PyTorch handle memory automatically
         noise = torch.randn(batch['pcd_full'].shape, device=self.device)
         
         # sample step t
@@ -189,14 +218,19 @@ class DiffusionPoints(LightningModule):
         t_sample = batch['pcd_full'] + self.q_sample(torch.zeros_like(batch['pcd_full']), t, noise)
 
         # replace the original points with the noise sampled
+        # Tensorize noisy full cloud (xyz only)
         x_full = self.points_to_tensor(t_sample, batch['mean'], batch['std'])
 
         # for classifier-free guidance switch between conditional and unconditional training
+        # Partial conditioning with optional intensity feature
         if torch.rand(1) > self.hparams['train']['uncond_prob'] or batch['pcd_full'].shape[0] == 1:
-            x_part = self.points_to_tensor(batch['pcd_part'], batch['mean'], batch['std'])
-        else:
             x_part = self.points_to_tensor(
-                torch.zeros_like(batch['pcd_part']), torch.zeros_like(batch['mean']), torch.zeros_like(batch['std'])
+                batch['pcd_part'], batch['mean'], batch['std'], batch['intensity_part']
+            )
+        else:
+            zeros_int = torch.zeros_like(batch['intensity_part'])
+            x_part = self.points_to_tensor(
+                torch.zeros_like(batch['pcd_part']), batch['mean'], batch['std'], zeros_int
             )
 
         denoise_t = self.forward(x_full, x_full.sparse(), x_part, t)
@@ -212,7 +246,7 @@ class DiffusionPoints(LightningModule):
         self.log('train/loss', loss)
         self.log('train/var', std_noise.var())
         self.log('train/std', std_noise.std())
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()  # Let PyTorch handle memory automatically
 
         return loss
 
@@ -226,12 +260,17 @@ class DiffusionPoints(LightningModule):
             gt_pts = batch['pcd_full'].detach().cpu().numpy()
 
             # for inference we get the partial pcd and sample the noise around the partial
+            # Initialize with partial scan and preserve intensity
             x_init = batch['pcd_part'].repeat(1,10,1)
+            i_init = batch['intensity_part'].repeat(1,10,1)
             x_feats = x_init + torch.randn(x_init.shape, device=self.device)
-            x_full = self.points_to_tensor(x_feats, batch['mean'], batch['std'])
-            x_part = self.points_to_tensor(batch['pcd_part'], batch['mean'], batch['std'])
+            x_full = self.points_to_tensor(x_feats, batch['mean'], batch['std'], i_init)
+            x_part = self.points_to_tensor(
+                batch['pcd_part'], batch['mean'], batch['std'], batch['intensity_part']
+            )
+            zeros_int = torch.zeros_like(batch['intensity_part'])
             x_uncond = self.points_to_tensor(
-                torch.zeros_like(batch['pcd_part']), torch.zeros_like(batch['mean']), torch.zeros_like(batch['std'])
+                torch.zeros_like(batch['pcd_part']), batch['mean'], batch['std'], zeros_int
             )
 
             x_gen_eval = self.p_sample_loop(x_init, x_full, x_part, x_uncond, gt_pts, batch['mean'], batch['std'])
@@ -257,7 +296,7 @@ class DiffusionPoints(LightningModule):
         self.log('val/precision', pr, on_step=True)
         self.log('val/recall', re, on_step=True)
         self.log('val/fscore', f1, on_step=True)
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()  # Let PyTorch handle memory automatically
 
         return {'val/cd_mean': cd_mean, 'val/cd_std': cd_std, 'val/precision': pr, 'val/recall': re, 'val/fscore': f1}
     
@@ -287,12 +326,17 @@ class DiffusionPoints(LightningModule):
 
             gt_pts = batch['pcd_full'].detach().cpu().numpy()
 
+            # Initialize from partial scan with intensity
             x_init = batch['pcd_part'].repeat(1,10,1)
+            i_init = batch['intensity_part'].repeat(1,10,1)
             x_feats = x_init + torch.randn(x_init.shape, device=self.device)
-            x_full = self.points_to_tensor(x_feats, batch['mean'], batch['std'])
-            x_part = self.points_to_tensor(batch['pcd_part'], batch['mean'], batch['std'])
+            x_full = self.points_to_tensor(x_feats, batch['mean'], batch['std'], i_init)
+            x_part = self.points_to_tensor(
+                batch['pcd_part'], batch['mean'], batch['std'], batch['intensity_part']
+            )
+            zeros_int = torch.zeros_like(batch['intensity_part'])
             x_uncond = self.points_to_tensor(
-                torch.zeros_like(batch['pcd_part']), torch.zeros_like(batch['mean']), torch.zeros_like(batch['std'])
+                torch.zeros_like(batch['pcd_part']), batch['mean'], batch['std'], zeros_int
             )
 
             x_gen_eval = self.p_sample_loop(x_init, x_full, x_part, x_uncond, gt_pts, batch['mean'], batch['std'])
@@ -330,7 +374,7 @@ class DiffusionPoints(LightningModule):
         self.log('test/precision', pr, on_step=True)
         self.log('test/recall', re, on_step=True)
         self.log('test/fscore', f1, on_step=True)
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()  # Let PyTorch handle memory automatically
 
         return {'test/cd_mean': cd_mean, 'test/cd_std': cd_std, 'test/precision': pr, 'test/recall': re, 'test/fscore': f1}
 

@@ -83,10 +83,15 @@ class ResidualBlock(nn.Module):
 class MinkGlobalEnc(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
-        cr = kwargs.get('cr', 1.0)
         in_channels = kwargs.get('in_channels', 3)
-        cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
-        cs = [int(cr * x) for x in cs]
+        out_channels = kwargs.get('out_channels', None)
+        base_cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
+        if out_channels is not None:
+            ratio = out_channels / base_cs[-1]
+            cs = [max(1, int(x * ratio)) for x in base_cs]
+        else:
+            cr = kwargs.get('cr', 1.0)
+            cs = [int(cr * x) for x in base_cs]
         self.embed_dim = cs[-1]
         self.run_up = kwargs.get('run_up', True)
         self.D = kwargs.get('D', 3)
@@ -145,10 +150,15 @@ class MinkUNetDiff(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
 
-        cr = kwargs.get('cr', 1.0)
         in_channels = kwargs.get('in_channels', 3)
-        cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
-        cs = [int(cr * x) for x in cs] 
+        out_channels = kwargs.get('out_channels', None)
+        base_cs = [32, 32, 64, 128, 256, 256, 128, 96, 96]
+        if out_channels is not None:
+            ratio = out_channels / base_cs[-1]
+            cs = [max(1, int(x * ratio)) for x in base_cs]
+        else:
+            cr = kwargs.get('cr', 1.0)
+            cs = [int(cr * x) for x in base_cs]
         self.embed_dim = cs[-1]
         self.run_up = kwargs.get('run_up', True)
         self.D = kwargs.get('D', 3)
@@ -392,7 +402,8 @@ class MinkUNetDiff(nn.Module):
 
         half_dim = self.embed_dim // 2
         emb = np.log(10000) / (half_dim - 1)
-        emb = torch.from_numpy(np.exp(np.arange(0, half_dim) * -emb)).float().to(torch.device('cuda'))
+        device = timesteps.device
+        emb = torch.from_numpy(np.exp(np.arange(0, half_dim) * -emb)).float().to(device)
         emb = timesteps[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
         if self.embed_dim % 2 == 1:  # zero pad

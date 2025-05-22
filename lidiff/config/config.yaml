@@ -36,4 +36,8 @@ diff:
 
 ##Network
 model:
-    out_dim: 96
+    # input channels: full cloud only xyz=3, partial cloud may include intensity
+    in_channels_full: 3
+    in_channels_part: 4
+    # output embedding dimension for diffusion network
+    out_dim: 128
