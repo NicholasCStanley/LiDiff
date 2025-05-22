@@ -25,6 +25,41 @@ To setup the code run the following command on the code main directory:
 
 `pip3 install -U -e .`
 
+### Blackwell Architecture (CUDA 12.8) Setup
+
+To run this code on NVIDIA Blackwell GPUs with CUDA 12.8, follow these steps:
+
+1. Install PyTorch 2.7+ built for CUDA 12.8, for example:
+   ```bash
+   pip install torch==2.7.0+cu128 torchvision==0.15.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+   ```
+2. Build and install MinkowskiEngine from source for CUDA 12.8:
+   ```bash
+   git clone https://github.com/NVIDIA/MinkowskiEngine.git
+   cd MinkowskiEngine
+   python3 setup.py install
+   ```
+3. Build and install PyTorch3D from source for CUDA 12.8:
+   ```bash
+   pip install 'git+https://github.com/facebookresearch/pytorch3d.git@v0.7.5' --no-deps
+   ```
+4. Install remaining requirements and the package:
+   ```bash
+   pip3 install -r requirements.txt
+   pip3 install -U -e .
+   ```
+5. Verify GPU usage and performance, e.g.:
+   ```bash
+   torchrun --nproc_per_node=<num_gpus> lidiff/tools/diff_completion_pipeline.py \
+     --diff DIFF_CKPT --refine REFINE_CKPT -T DENOISING_STEPS -s CONDITIONING_WEIGHT
+   ```
+6. (Optional) To enable TF32 and cudnn.benchmark for extra throughput on Blackwell:
+   ```python
+   import torch
+   torch.backends.cuda.matmul.allow_tf32 = True
+   torch.backends.cudnn.benchmark = True
+   ```
+
 **Note:** The codebase has been updated to support modern dependencies including PyTorch 2.0+, PyTorch Lightning 2.1+, and diffusers 0.24+. See the [Recent Improvements](#recent-improvements) section for details.
 
 ## SemanticKITTI Dataset
